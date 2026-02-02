@@ -216,6 +216,10 @@ class LatentDenoiser(nn.Module):
         self.out = nn.Linear(1024, latent_dim)
 
     def forward(self, z: torch.Tensor, t: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        if cond.dim() == 1:
+            cond = cond.unsqueeze(0)
+        if t.dim() == 1:
+            t = t.unsqueeze(-1)
         t_embed = self.time_mlp(self.time_embed(t))
         cond_embed = self.cond_proj(cond)
         x = torch.cat([z, cond_embed, t_embed], dim=-1)
