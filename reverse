@@ -9,7 +9,7 @@ import os
 import matplotlib.pyplot as plt
 import torch
 
-from physgenrd import DiffusionConfig, GrainConfig, TrainingConfig, reverse_design
+from physgenrd import DiffusionConfig, GrainConfig, TrainingConfig, reverse_design_loop
 
 
 def build_target_curve(cfg: GrainConfig) -> torch.Tensor:
@@ -28,7 +28,7 @@ def main() -> None:
     os.makedirs(out_dir, exist_ok=True)
 
     target_curve = build_target_curve(cfg)
-    result = reverse_design(target_curve.to(cfg.device), cfg, diff_cfg, train_cfg)
+    result = reverse_design_loop(target_curve.to(cfg.device), cfg, diff_cfg, train_cfg)
 
     time_grid = torch.arange(0.0, cfg.t_end + cfg.dt, cfg.dt)
     plt.figure(figsize=(8, 4))

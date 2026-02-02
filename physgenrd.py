@@ -54,6 +54,15 @@ class TrainingConfig:
     target_loading: float = 0.70
     min_loading: float = 0.35
     max_loading: float = 1.00
+    loop_steps: int = 3
+    inner_iters: int = 400
+    performance_tol: float = 0.05
+    guidance_scale: float = 4.0
+    pinn_weight: float = 2.5
+    loading_weight: float = 8.0
+    smooth_weight: float = 0.25
+    latent_weight: float = 0.05
+    cond_dropout: float = 0.1
 
 
 def set_seed(seed: int) -> None:
@@ -106,6 +115,38 @@ class PositionalEncoding(nn.Module):
         return torch.cat(enc, dim=-1)
 
 
+class SinusoidalTimeEmbedding(nn.Module):
+    def __init__(self, dim: int = 128) -> None:
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        half = self.dim // 2
+        device = t.device
+        freqs = torch.exp(
+            -math.log(10000.0) * torch.arange(0, half, device=device).float() / (half - 1)
+        )
+        args = t * freqs
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+        return emb
+
+
+class MLPBlock(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int, residual: bool = False) -> None:
+        super().__init__()
+        self.residual = residual and in_dim == out_dim
+        self.fc1 = nn.Linear(in_dim, out_dim)
+        self.fc2 = nn.Linear(out_dim, out_dim)
+        self.act = nn.SiLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.act(self.fc1(x))
+        out = self.fc2(out)
+        if self.residual:
+            out = out + x
+        return self.act(out)
+
+
 class CurveEncoder(nn.Module):
     def __init__(self, in_channels: int = 1, hidden: int = 128, out_dim: int = 256) -> None:
         super().__init__()
@@ -137,42 +178,48 @@ class NeuralSDFField(nn.Module):
         self.latent_dim = latent_dim
         self.cond_dim = cond_dim
         self.in_dim = enc_dim + latent_dim + cond_dim
-        blocks = []
+        self.layers = nn.ModuleList()
         for i in range(layers):
             in_features = self.in_dim if i == 0 else hidden
-            blocks.append(nn.Linear(in_features, hidden))
-            blocks.append(nn.SiLU())
-        blocks.append(nn.Linear(hidden, 1))
-        self.net = nn.Sequential(*blocks)
+            self.layers.append(MLPBlock(in_features, hidden, residual=i > 0))
+        self.skip_index = layers // 2
+        self.out = nn.Linear(hidden + self.in_dim, 1)
 
     def forward(self, enc: torch.Tensor, z: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         z_expanded = z.unsqueeze(0).expand(enc.shape[0], -1)
         cond_expanded = cond.unsqueeze(0).expand(enc.shape[0], -1)
         x = torch.cat([enc, z_expanded, cond_expanded], dim=-1)
-        sdf = self.net(x).squeeze(-1)
+        h = x
+        for idx, layer in enumerate(self.layers):
+            h = layer(h)
+            if idx == self.skip_index:
+                h = torch.cat([h, x], dim=-1)
+        sdf = self.out(h).squeeze(-1)
         return torch.clamp(sdf, -1.0, 1.0)
 
 
 class LatentDenoiser(nn.Module):
     def __init__(self, latent_dim: int, cond_dim: int) -> None:
         super().__init__()
+        self.time_embed = SinusoidalTimeEmbedding(128)
         self.time_mlp = nn.Sequential(
-            nn.Linear(1, 64),
+            nn.Linear(128, 256),
             nn.SiLU(),
-            nn.Linear(64, 64),
+            nn.Linear(256, 256),
         )
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim + cond_dim + 64, 1024),
-            nn.SiLU(),
-            nn.Linear(1024, 1024),
-            nn.SiLU(),
-            nn.Linear(1024, latent_dim),
+        self.cond_proj = nn.Linear(cond_dim, 256)
+        self.blocks = nn.Sequential(
+            MLPBlock(latent_dim + 256 + 256, 1024),
+            MLPBlock(1024, 1024, residual=True),
+            MLPBlock(1024, 1024, residual=True),
         )
+        self.out = nn.Linear(1024, latent_dim)
 
     def forward(self, z: torch.Tensor, t: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        t_embed = self.time_mlp(t)
-        x = torch.cat([z, cond, t_embed], dim=-1)
-        return self.net(x)
+        t_embed = self.time_mlp(self.time_embed(t))
+        cond_embed = self.cond_proj(cond)
+        x = torch.cat([z, cond_embed, t_embed], dim=-1)
+        return self.out(self.blocks(x))
 
 
 class LatentDiffusion(nn.Module):
@@ -227,15 +274,7 @@ class LatentDiffusion(nn.Module):
 class PhysicsSurrogate(nn.Module):
     def __init__(self, grid_size: int) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv3d(1, 16, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv3d(16, 32, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv3d(32, 16, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv3d(16, 1, kernel_size=1),
-        )
+        self.net = FNO3D(in_channels=1, hidden=32, modes=8, layers=3)
         self.grid_size = grid_size
 
     def forward(self, sdf_grid: torch.Tensor) -> torch.Tensor:
@@ -245,6 +284,68 @@ class PhysicsSurrogate(nn.Module):
         grad = torch.gradient(w, spacing=(spacing, spacing, spacing))
         grad_norm = torch.sqrt(sum(g**2 for g in grad) + 1e-8)
         return (grad_norm - 1.0).pow(2).mean()
+
+
+class SpectralConv3d(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, modes: int) -> None:
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.modes = modes
+        scale = 1 / (in_channels * out_channels)
+        self.weight = nn.Parameter(
+            scale * torch.randn(in_channels, out_channels, modes, modes, modes, dtype=torch.cfloat)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, channels, nx, ny, nz = x.shape
+        x_ft = torch.fft.rfftn(x, dim=(-3, -2, -1))
+        out_ft = torch.zeros(
+            batch,
+            self.out_channels,
+            nx,
+            ny,
+            nz // 2 + 1,
+            device=x.device,
+            dtype=torch.cfloat,
+        )
+        mx = min(self.modes, nx)
+        my = min(self.modes, ny)
+        mz = min(self.modes, nz // 2 + 1)
+        out_ft[:, :, :mx, :my, :mz] = torch.einsum(
+            "bixyz,ioxyz->boxyz", x_ft[:, :, :mx, :my, :mz], self.weight[:, :, :mx, :my, :mz]
+        )
+        x = torch.fft.irfftn(out_ft, s=(nx, ny, nz))
+        return x
+
+
+class FNOBlock(nn.Module):
+    def __init__(self, hidden: int, modes: int) -> None:
+        super().__init__()
+        self.spectral = SpectralConv3d(hidden, hidden, modes)
+        self.pointwise = nn.Conv3d(hidden, hidden, kernel_size=1)
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(self.spectral(x) + self.pointwise(x))
+
+
+class FNO3D(nn.Module):
+    def __init__(self, in_channels: int, hidden: int, modes: int, layers: int) -> None:
+        super().__init__()
+        self.input_proj = nn.Conv3d(in_channels, hidden, kernel_size=1)
+        self.blocks = nn.ModuleList([FNOBlock(hidden, modes) for _ in range(layers)])
+        self.output_proj = nn.Sequential(
+            nn.Conv3d(hidden, hidden, kernel_size=1),
+            nn.GELU(),
+            nn.Conv3d(hidden, 1, kernel_size=1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.input_proj(x)
+        for block in self.blocks:
+            x = block(x)
+        return self.output_proj(x)
 
 
 def surface_area_from_w(w: torch.Tensor, spacing: float, levels: torch.Tensor) -> torch.Tensor:
@@ -286,6 +387,10 @@ def loading_fraction(phi: torch.Tensor, cfg: GrainConfig, spacing: float) -> tor
 
 def sdf_to_occupancy(sdf: torch.Tensor) -> torch.Tensor:
     return torch.sigmoid(-10.0 * sdf)
+
+
+def occupancy_smoothness(phi: torch.Tensor) -> torch.Tensor:
+    return (phi * (1.0 - phi)).mean()
 
 
 def forward_performance(
@@ -378,7 +483,7 @@ def reverse_design(
         load_loss += 10.0 * nnF.relu(train_cfg.min_loading - load_frac) ** 2
         load_loss += 50.0 * nnF.relu(load_frac - train_cfg.max_loading) ** 2
 
-        loss = 20.0 * fit_loss + 2.0 * eikonal_loss + 10.0 * load_loss
+        loss = 20.0 * fit_loss + train_cfg.pinn_weight * eikonal_loss + train_cfg.loading_weight * load_loss
         loss.backward()
         torch.nn.utils.clip_grad_norm_(list(sdf_field.parameters()) + [z], train_cfg.clip_grad)
         optimizer.step()
@@ -397,3 +502,110 @@ def reverse_design(
         "loading": final_out["loading"],
         "latent": z.detach(),
     }
+
+
+def _build_optimizer_modules(
+    cfg: GrainConfig,
+    diff_cfg: DiffusionConfig,
+    target_curve: torch.Tensor,
+    coords_flat: torch.Tensor,
+) -> Tuple[PositionalEncoding, CurveEncoder, NeuralSDFField, PhysicsSurrogate, LatentDiffusion, torch.Tensor]:
+    encoder = PositionalEncoding().to(cfg.device)
+    curve_encoder = CurveEncoder().to(cfg.device)
+    cond = curve_encoder(target_curve.unsqueeze(0).unsqueeze(0))
+    sdf_field = NeuralSDFField(
+        enc_dim=encoder(coords_flat[:1]).shape[-1],
+        latent_dim=diff_cfg.latent_dim,
+        cond_dim=cond.shape[-1],
+    ).to(cfg.device)
+    surrogate = PhysicsSurrogate(cfg.grid_size).to(cfg.device)
+    diffusion = LatentDiffusion(diff_cfg, cond_dim=cond.shape[-1]).to(cfg.device)
+    return encoder, curve_encoder, sdf_field, surrogate, diffusion, cond.squeeze(0)
+
+
+def reverse_design_loop(
+    target_curve: torch.Tensor,
+    cfg: GrainConfig,
+    diff_cfg: DiffusionConfig,
+    train_cfg: TrainingConfig,
+) -> Dict[str, torch.Tensor]:
+    """STEP 1~3 루프 기반 역설계.
+
+    STEP 1: 성능 요구사항 분석 (조건 임베딩 및 목표 정규화)
+    STEP 2: 최적화 (latent + SDF 필드 + PINN 잔차)
+    STEP 3: SRM 성능 체크 (forward 성능 검증 및 허용오차 평가)
+    """
+    set_seed(cfg.seed)
+    device = torch.device(cfg.device)
+    _, _, _, coords_flat = make_grid(cfg)
+    coords_flat = coords_flat.to(device)
+
+    encoder, _, sdf_field, surrogate, diffusion, cond = _build_optimizer_modules(
+        cfg, diff_cfg, target_curve, coords_flat
+    )
+    if train_cfg.cond_dropout > 0:
+        drop_mask = (torch.rand_like(cond) > train_cfg.cond_dropout).float()
+        cond = cond * drop_mask
+
+    z = nn.Parameter(diffusion.sample(cond, guidance_scale=train_cfg.guidance_scale))
+    optimizer = optim.AdamW(list(sdf_field.parameters()) + [z], lr=train_cfg.lr)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=train_cfg.inner_iters)
+
+    best = None
+    for step in range(train_cfg.loop_steps):
+        for it in range(train_cfg.inner_iters):
+            optimizer.zero_grad()
+            out = forward_performance(sdf_field, encoder, surrogate, coords_flat, cfg, z, cond)
+            pc = out["Pc"]
+            fit_loss = nnF.mse_loss(pc, target_curve)
+            spacing = max(cfg.length, 2 * cfg.case_radius) / cfg.grid_size
+            eikonal_loss = surrogate.eikonal_residual(out["W"], spacing)
+            load_frac = out["loading"]
+            load_loss = (train_cfg.target_loading - load_frac) ** 2
+            load_loss += 10.0 * nnF.relu(train_cfg.min_loading - load_frac) ** 2
+            load_loss += 50.0 * nnF.relu(load_frac - train_cfg.max_loading) ** 2
+            smooth_loss = occupancy_smoothness(sdf_to_occupancy(out["sdf"]))
+            latent_loss = (z.pow(2).mean())
+
+            loss = (
+                20.0 * fit_loss
+                + train_cfg.pinn_weight * eikonal_loss
+                + train_cfg.loading_weight * load_loss
+                + train_cfg.smooth_weight * smooth_loss
+                + train_cfg.latent_weight * latent_loss
+            )
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(list(sdf_field.parameters()) + [z], train_cfg.clip_grad)
+            optimizer.step()
+            scheduler.step()
+
+            if it % 200 == 0:
+                rel_err = torch.mean(torch.abs(pc - target_curve) / (target_curve + 1e-6))
+                print(
+                    f"Loop {step + 1}/{train_cfg.loop_steps} | Iter {it:4d} | "
+                    f"Loss {loss.item():.3e} | RelErr {rel_err:.3f} | Load {load_frac:.3f}"
+                )
+
+        with torch.no_grad():
+            out = forward_performance(sdf_field, encoder, surrogate, coords_flat, cfg, z, cond)
+            rel_err = torch.mean(torch.abs(out["Pc"] - target_curve) / (target_curve + 1e-6))
+            candidate = {
+                "Pc": out["Pc"],
+                "F": out["F"],
+                "sdf": out["sdf"],
+                "W": out["W"],
+                "loading": out["loading"],
+                "latent": z.detach().clone(),
+                "rel_err": rel_err,
+                "loop": step + 1,
+            }
+            if best is None or rel_err < best["rel_err"]:
+                best = candidate
+            if rel_err <= train_cfg.performance_tol:
+                break
+
+        z = nn.Parameter(diffusion.sample(cond, guidance_scale=train_cfg.guidance_scale))
+        optimizer = optim.AdamW(list(sdf_field.parameters()) + [z], lr=train_cfg.lr)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=train_cfg.inner_iters)
+
+    return best
