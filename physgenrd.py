@@ -216,10 +216,14 @@ class LatentDenoiser(nn.Module):
         self.out = nn.Linear(1024, latent_dim)
 
     def forward(self, z: torch.Tensor, t: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        if z.dim() == 1:
+            z = z.unsqueeze(0)
         if cond.dim() == 1:
             cond = cond.unsqueeze(0)
-        if t.dim() == 1:
-            t = t.unsqueeze(-1)
+        if t.dim() > 1 and t.shape[-1] == 1:
+            t = t.squeeze(-1)
+        if t.dim() == 0:
+            t = t.unsqueeze(0)
         t_embed = self.time_mlp(self.time_embed(t))
         cond_embed = self.cond_proj(cond)
         x = torch.cat([z, cond_embed, t_embed], dim=-1)
@@ -245,7 +249,7 @@ class LatentDiffusion(nn.Module):
         return sqrt_alpha * z0 + sqrt_one_minus * noise
 
     def predict_eps(self, zt: torch.Tensor, t: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        time = t.float().unsqueeze(-1) / float(self.cfg.time_steps)
+        time = t.float() / float(self.cfg.time_steps)
         return self.denoiser(zt, time, cond)
 
     def p_sample(self, zt: torch.Tensor, t: int, cond: torch.Tensor) -> torch.Tensor:
